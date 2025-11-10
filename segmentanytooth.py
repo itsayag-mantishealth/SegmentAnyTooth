@@ -38,6 +38,7 @@ def predict(
     view: Literal["upper", "lower", "left", "right", "front"],
     weight_dir: Optional[str] = "./weight",
     sam_batch_size: Optional[int] = 10,
+    conf_threshold: Optional[float] = 0.25,
 ) -> np.ndarray:
     """Predicts a semantic segmentation mask for teeth in the given image.
 
@@ -46,6 +47,7 @@ def predict(
         view (str): View type ("upper", "lower", "left", "right", "front").
         weight_dir (str, optional): Directory containing model weights.
         sam_batch_size (int, optional): Batch size for SAM prediction.
+        conf_threshold (float, optional): Confidence threshold for YOLO detection (default: 0.25).
 
     Returns:
         np.ndarray: Segmentation mask with FDI tooth labels.
@@ -68,11 +70,18 @@ def predict(
             save_conf=False,
             save_crop=False,
             project=None,
+            conf=conf_threshold,
         )[0]
 
     # Early exit if no detections
     if r.boxes is None or len(r.boxes) == 0:
+        print(f"WARNING: No teeth detected in the image!")
+        print(f"Image shape: {image.shape}")
+        print(f"YOLO model path: {get_model_path(view, weight_dir)}")
+        print(f"View: {view}, Flipped: {should_flip}")
         return np.zeros(image.shape[:2], dtype=np.uint8)
+
+    print(f"Detected {len(r.boxes)} teeth")
 
     # Get YOLO output
     names = r.names if not should_flip else LEFT_CLASSES
@@ -129,9 +138,16 @@ def get_model_path(
 
 
 if __name__ == "__main__":
+    # Test with 3D rendered image using front view and lower confidence threshold
     mask = predict(
-        image_path="examples/upper.jpg",
-        view="upper",
-        weight_dir="./weight",
+        image_path="/home/itamar/data/itsayag_dental_sample_sceneflow/Upper_80e10746852d0e5aa2e747c413c78055/frames_cleanpass/left/0002.png",
+        view="front",
+        weight_dir="/home/itamar/git/mantis/pretrained_models/SegmentAnyToothWeights",
+        conf_threshold=0.01,  # Much lower threshold to try detecting 3D renders
     )
-    cv2.imwrite("predicted_mask.png")
+    print(f"Mask shape: {mask.shape}")
+    print(f"Mask dtype: {mask.dtype}")
+    print(f"Mask min: {mask.min()}, max: {mask.max()}")
+    print(f"Unique values in mask: {np.unique(mask)}")
+    print(f"Number of non-zero pixels: {np.count_nonzero(mask)}")
+    cv2.imwrite("predicted_mask.png", mask * 5)
