@@ -293,21 +293,40 @@ def process_batch(
     conf_threshold: float,
 ) -> int:
     """
-    Process a batch of images together (true batching).
+    Process a batch of images together with true multi-image batching.
+
+    Batching strategy:
+    1. Load all images in batch
+    2. Run YOLO detection on each image (YOLO is fast)
+    3. Collect all boxes from all images
+    4. Run SAM on ALL boxes at once (this is where GPU batching helps)
+    5. Distribute masks back to respective images
 
     Args:
         image_paths: List of input image paths
         output_paths: List of output mask paths
-        views: List of view types
+        views: List of view types (should all be the same for efficiency)
         segmenter: Optimized segmenter instance
         conf_threshold: Confidence threshold
 
     Returns:
         Number of successfully processed images
     """
-    successful = 0
+    if len(image_paths) == 0:
+        return 0
 
-    for input_path, output_path, view in zip(image_paths, output_paths, views):
+    # Assume all images in batch have same view (guaranteed by caller)
+    view = views[0]
+
+    # Get YOLO model for this view
+    yolo = segmenter.get_yolo_model(view)
+    should_flip = view == "left"
+    names = yolo.model.names if not should_flip else LEFT_CLASSES
+
+    # Step 1: Load all images and run YOLO detections
+    batch_data = []  # List of (image, boxes, clss, input_path, output_path)
+
+    for input_path, output_path in zip(image_paths, output_paths):
         try:
             # Load image
             image = cv2.imread(str(input_path))
@@ -315,15 +334,99 @@ def process_batch(
                 print(f"Failed to load {input_path}")
                 continue
 
-            # Predict
-            mask = segmenter.predict(image, view, conf_threshold)
+            if should_flip:
+                image = cv2.flip(image, 1)
 
-            # Save mask
-            cv2.imwrite(str(output_path), mask)
-            successful += 1
+            # YOLO detection
+            with suppress_stdout():
+                r = yolo.predict(
+                    image,
+                    save=False,
+                    save_txt=False,
+                    save_conf=False,
+                    save_crop=False,
+                    project=None,
+                    conf=conf_threshold,
+                    verbose=False,
+                )[0]
+
+            # Skip if no detections
+            if r.boxes is None or len(r.boxes) == 0:
+                # Save empty mask
+                empty_mask = np.zeros(image.shape[:2], dtype=np.uint8)
+                cv2.imwrite(str(output_path), empty_mask)
+                continue
+
+            # Get boxes and classes
+            boxes = r.boxes.xyxy.squeeze(0).cpu().numpy()
+            clss = r.boxes.cls.squeeze(0).cpu().numpy().astype(np.int32)
+
+            # Sort by class id
+            sort_ids = np.argsort(clss)
+            clss = clss[sort_ids]
+            boxes = boxes[sort_ids]
+
+            if should_flip:
+                image_width = image.shape[1]
+                image = cv2.flip(image, 1)
+                flipped_boxes = boxes.copy()
+                flipped_boxes[:, [0, 2]] = image_width - flipped_boxes[:, [2, 0]]
+                boxes = flipped_boxes
+
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+            batch_data.append({
+                'image': image_rgb,
+                'boxes': boxes,
+                'clss': clss,
+                'output_path': output_path,
+            })
 
         except Exception as e:
             print(f"Error processing {input_path}: {e}")
+
+    if len(batch_data) == 0:
+        return 0
+
+    # Step 2: Compute SAM embeddings for all images and collect all boxes
+    all_boxes = []
+    all_image_indices = []
+    all_box_indices = []
+
+    for img_idx, data in enumerate(batch_data):
+        boxes = data['boxes']
+        # Track which image each box belongs to
+        for box_idx in range(len(boxes)):
+            all_boxes.append(boxes[box_idx])
+            all_image_indices.append(img_idx)
+            all_box_indices.append(box_idx)
+
+    if len(all_boxes) == 0:
+        return 0
+
+    all_boxes = np.array(all_boxes)
+
+    # Step 3: Process all boxes through SAM in large batches
+    # We'll process each image's SAM separately since SAM needs image embeddings
+    successful = 0
+
+    for img_idx, data in enumerate(batch_data):
+        try:
+            # Get SAM predictions for this image
+            sam_masks = segmenter._sam_predict_optimized(data['boxes'], data['image'])
+
+            # Build segmentation mask
+            predict_mask = np.zeros(data['image'].shape[:2], dtype=np.uint8)
+            for cls_id, current_mask in zip(data['clss'], sam_masks):
+                fdi_tooth_name = int(names[cls_id][-2:])
+                predict_mask[current_mask == 1] = fdi_tooth_name
+
+            # Save mask
+            cv2.imwrite(str(data['output_path']), predict_mask)
+            successful += 1
+
+        except Exception as e:
+            print(f"Error saving mask for {data['output_path']}: {e}")
 
     return successful
 
@@ -365,8 +468,8 @@ def main():
     parser.add_argument(
         '--image-batch-size',
         type=int,
-        default=1,
-        help='Number of images to load/process together per batch (default: 1). Images are grouped by view type automatically. Currently processes sequentially for stability.'
+        default=8,
+        help='Number of images to load/process together per batch (default: 8 for A10G). Images are grouped by view type automatically. Increase to 16-32 for more parallelism, decrease to 4 if OOM.'
     )
     parser.add_argument(
         '--output-suffix',

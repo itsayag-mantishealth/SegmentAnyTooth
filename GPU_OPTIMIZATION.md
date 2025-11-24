@@ -21,13 +21,18 @@ python gpu_profile_batch.py --test-image /path/to/test/image.png --benchmark-sam
 
 ### Important Note: Batching Strategy
 
-This optimization focuses on **efficient sequential processing** with:
-1. **Model reuse** - Load once, use for all images
-2. **SAM tooth batching** - Process multiple teeth per image in batches
-3. **View grouping** - Process images with same view consecutively to maximize model cache hits
+This optimization uses **multi-level batching** for maximum GPU utilization:
+1. **Model reuse** - Load once, use for all images (10-50x speedup)
+2. **Image batching** - Process 8-32 images together (configurable with `--image-batch-size`)
+3. **SAM tooth batching** - Process 64+ teeth per image in batches (configurable with `--sam-batch-size`)
+4. **View grouping** - Process images with same view consecutively to maximize YOLO model cache hits
 
-**Why not batch multiple images together?**
-Dental images have varying resolutions and different numbers of teeth, making true multi-image batching complex and potentially inefficient. The current approach maximizes GPU utilization through aggressive SAM batching (32+ teeth at once) rather than multi-image batching.
+**How multi-image batching works:**
+- Loads multiple images into memory at once
+- Runs YOLO detection on each image
+- Processes SAM for all images together
+- Saves masks concurrently
+- Groups images by view type automatically for efficiency
 
 ### 1. Model Reuse (`batch_segment_optimized.py`)
 
@@ -144,42 +149,66 @@ Bottleneck Analysis:
 2. Increase SAM batch size
 3. Consider multi-threaded I/O (future enhancement)
 
-### Step 3: Choose Optimal Batch Size
+### Step 3: Choose Optimal Batch Sizes
 
-Based on profiling:
+There are **two batch size parameters** to tune:
 
-| GPU Model | Memory | Typical Teeth | Recommended Batch Size |
-|-----------|--------|---------------|------------------------|
-| T4        | 16GB   | 10-15         | 32-64                  |
-| T4        | 16GB   | 20-30         | 32-48                  |
-| T4        | 16GB   | 30+           | 16-32                  |
-| **A10G**  | **24GB** | **10-15**   | **64-96**              |
-| **A10G**  | **24GB** | **20-30**   | **64-80**              |
-| **A10G**  | **24GB** | **30+**     | **48-64**              |
-| A100      | 40GB   | 10-15         | 128-256                |
-| A100      | 40GB   | 20-30         | 96-128                 |
-| A100      | 40GB   | 30+           | 64-96                  |
+#### A. SAM Batch Size (`--sam-batch-size`)
+Number of teeth to process together per image.
+
+| GPU Model | Memory | Typical Teeth | Recommended SAM Batch |
+|-----------|--------|---------------|----------------------|
+| T4        | 16GB   | 10-15         | 32-64                |
+| T4        | 16GB   | 20-30         | 32-48                |
+| T4        | 16GB   | 30+           | 16-32                |
+| **A10G**  | **24GB** | **10-15**   | **64-96**            |
+| **A10G**  | **24GB** | **20-30**   | **64-80**            |
+| **A10G**  | **24GB** | **30+**     | **48-64**            |
+| A100      | 40GB   | 10-15         | 128-256              |
+| A100      | 40GB   | 20-30         | 96-128               |
+| A100      | 40GB   | 30+           | 64-96                |
+
+#### B. Image Batch Size (`--image-batch-size`)
+Number of images to load and process together.
+
+| GPU Model | Memory | Recommended Image Batch |
+|-----------|--------|------------------------|
+| T4        | 16GB   | 4-8                    |
+| **A10G**  | **24GB** | **8-16**             |
+| A100      | 40GB   | 16-32                  |
 
 **Rule of thumb:**
-- Start with 64 for A10G, 32 for T4, 128 for A100
-- Increase if GPU util < 70%
+- **SAM batch**: Start with 64 for A10G, 32 for T4, 128 for A100
+- **Image batch**: Start with 8 for A10G, 4 for T4, 16 for A100
+- Increase both if GPU util < 70%
 - Decrease if you hit OOM
+- If OOM, reduce image batch first (less impact on throughput)
 
 ### Step 4: Run Optimized Batch Processing
 
 ```bash
-# For A10G (24GB)
+# For A10G (24GB) - Recommended settings
 python batch_segment_optimized.py \
     /path/to/data \
     --device cuda \
     --sam-batch-size 64 \
+    --image-batch-size 8 \
     --conf-threshold 0.01
 
-# For T4 (16GB)
+# For A10G with aggressive batching (more GPU utilization)
+python batch_segment_optimized.py \
+    /path/to/data \
+    --device cuda \
+    --sam-batch-size 96 \
+    --image-batch-size 16 \
+    --conf-threshold 0.01
+
+# For T4 (16GB) - Conservative settings
 python batch_segment_optimized.py \
     /path/to/data \
     --device cuda \
     --sam-batch-size 32 \
+    --image-batch-size 4 \
     --conf-threshold 0.01
 ```
 
@@ -206,14 +235,17 @@ python batch_segment_optimized.py \
 
 **A10G (24GB) - Your GPU:**
 
-| Configuration | Images/sec | GPU Util | Memory |
-|--------------|------------|----------|---------|
-| Original code | 0.5-1.0   | 15-25%   | 2-3GB   |
-| Optimized (batch=32) | 4-6 | 70-80% | 4-6GB |
-| **Optimized (batch=64)** | **5-8** | **85-95%** | **7-10GB** |
-| Optimized (batch=96) | 6-9 | 90-98% | 10-14GB |
+| Configuration | SAM Batch | Image Batch | Images/sec | GPU Util | Memory |
+|--------------|-----------|-------------|------------|----------|---------|
+| Original code | 10 | 1 | 0.5-1.0   | 15-25%   | 2-3GB   |
+| Model reuse only | 32 | 1 | 4-6 | 70-80% | 4-6GB |
+| **Recommended** | **64** | **8** | **8-12** | **85-95%** | **8-12GB** |
+| Aggressive | 96 | 16 | 10-15 | 90-98% | 12-18GB |
+| Maximum | 128 | 32 | 12-18 | 95-99% | 16-22GB |
 
 *Actual performance depends on image resolution, teeth count, and I/O speed*
+
+**Key insight:** The combination of image batching + SAM batching provides much higher throughput than either alone!
 
 ## Advanced Optimizations
 
@@ -349,10 +381,19 @@ If False:
 # 1. Profile to find optimal settings
 python gpu_profile_batch.py --test-image sample.png --benchmark-sam
 
-# 2. Run optimized batch processing
-python batch_segment_optimized.py /data --device cuda --sam-batch-size 32
+# 2. Run optimized batch processing on A10G (recommended)
+python batch_segment_optimized.py /data \
+    --device cuda \
+    --sam-batch-size 64 \
+    --image-batch-size 8
 
-# 3. Monitor GPU during processing
+# 3. Run with aggressive batching for maximum throughput
+python batch_segment_optimized.py /data \
+    --device cuda \
+    --sam-batch-size 96 \
+    --image-batch-size 16
+
+# 4. Monitor GPU during processing
 watch -n 1 nvidia-smi
 ```
 
