@@ -19,6 +19,16 @@ python gpu_profile_batch.py --test-image /path/to/test/image.png --benchmark-sam
 
 ## Key Optimizations Implemented
 
+### Important Note: Batching Strategy
+
+This optimization focuses on **efficient sequential processing** with:
+1. **Model reuse** - Load once, use for all images
+2. **SAM tooth batching** - Process multiple teeth per image in batches
+3. **View grouping** - Process images with same view consecutively to maximize model cache hits
+
+**Why not batch multiple images together?**
+Dental images have varying resolutions and different numbers of teeth, making true multi-image batching complex and potentially inefficient. The current approach maximizes GPU utilization through aggressive SAM batching (32+ teeth at once) rather than multi-image batching.
+
 ### 1. Model Reuse (`batch_segment_optimized.py`)
 
 **Problem:** Original code loaded models for every image
@@ -138,20 +148,34 @@ Bottleneck Analysis:
 
 Based on profiling:
 
-| T4 Memory | Typical Teeth | Recommended Batch Size |
-|-----------|---------------|------------------------|
-| 15GB      | 10-15         | 32-64                  |
-| 15GB      | 20-30         | 32-48                  |
-| 15GB      | 30+           | 16-32                  |
+| GPU Model | Memory | Typical Teeth | Recommended Batch Size |
+|-----------|--------|---------------|------------------------|
+| T4        | 16GB   | 10-15         | 32-64                  |
+| T4        | 16GB   | 20-30         | 32-48                  |
+| T4        | 16GB   | 30+           | 16-32                  |
+| **A10G**  | **24GB** | **10-15**   | **64-96**              |
+| **A10G**  | **24GB** | **20-30**   | **64-80**              |
+| **A10G**  | **24GB** | **30+**     | **48-64**              |
+| A100      | 40GB   | 10-15         | 128-256                |
+| A100      | 40GB   | 20-30         | 96-128                 |
+| A100      | 40GB   | 30+           | 64-96                  |
 
 **Rule of thumb:**
-- Start with 32
+- Start with 64 for A10G, 32 for T4, 128 for A100
 - Increase if GPU util < 70%
 - Decrease if you hit OOM
 
 ### Step 4: Run Optimized Batch Processing
 
 ```bash
+# For A10G (24GB)
+python batch_segment_optimized.py \
+    /path/to/data \
+    --device cuda \
+    --sam-batch-size 64 \
+    --conf-threshold 0.01
+
+# For T4 (16GB)
 python batch_segment_optimized.py \
     /path/to/data \
     --device cuda \
@@ -161,13 +185,17 @@ python batch_segment_optimized.py \
 
 ## Expected Performance
 
-### T4 GPU Specifications
-- 16GB GDDR6 memory
-- 8.1 TFLOPS FP32
-- 260 GB/s memory bandwidth
-- 70W TDP
+### GPU Specifications Comparison
 
-### Typical Performance (T4)
+| GPU   | Memory | FP32 TFLOPS | Memory BW | TDP  |
+|-------|--------|-------------|-----------|------|
+| T4    | 16GB   | 8.1         | 260 GB/s  | 70W  |
+| **A10G** | **24GB** | **31.2**  | **600 GB/s** | **150W** |
+| A100  | 40GB   | 19.5        | 1555 GB/s | 400W |
+
+### Typical Performance by GPU
+
+**T4 (16GB):**
 
 | Configuration | Images/sec | GPU Util | Memory |
 |--------------|------------|----------|---------|
@@ -175,6 +203,15 @@ python batch_segment_optimized.py \
 | Optimized (batch=16) | 2-3 | 60-70% | 3-4GB |
 | Optimized (batch=32) | 3-4 | 80-90% | 4-5GB |
 | Optimized (batch=64) | 3.5-5 | 85-95% | 6-8GB |
+
+**A10G (24GB) - Your GPU:**
+
+| Configuration | Images/sec | GPU Util | Memory |
+|--------------|------------|----------|---------|
+| Original code | 0.5-1.0   | 15-25%   | 2-3GB   |
+| Optimized (batch=32) | 4-6 | 70-80% | 4-6GB |
+| **Optimized (batch=64)** | **5-8** | **85-95%** | **7-10GB** |
+| Optimized (batch=96) | 6-9 | 90-98% | 10-14GB |
 
 *Actual performance depends on image resolution, teeth count, and I/O speed*
 

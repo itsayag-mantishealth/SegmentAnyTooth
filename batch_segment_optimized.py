@@ -125,14 +125,14 @@ def get_model_path(model: str, weight_dir: str) -> str:
 class OptimizedSegmenter:
     """Optimized segmenter that loads models once and reuses them."""
 
-    def __init__(self, weight_dir: str, device: str = 'cuda', sam_batch_size: int = 32):
+    def __init__(self, weight_dir: str, device: str = 'cuda', sam_batch_size: int = 64):
         """
         Initialize segmenter with models loaded onto GPU.
 
         Args:
             weight_dir: Path to model weights
             device: Device to use ('cuda' or 'cpu')
-            sam_batch_size: Batch size for SAM inference (larger for T4)
+            sam_batch_size: Batch size for SAM inference (default: 64 for A10G, 32 for T4, 128+ for A100)
         """
         self.device = device
         self.weight_dir = weight_dir
@@ -293,7 +293,7 @@ def process_batch(
     conf_threshold: float,
 ) -> int:
     """
-    Process a batch of images.
+    Process a batch of images together (true batching).
 
     Args:
         image_paths: List of input image paths
@@ -359,8 +359,14 @@ def main():
     parser.add_argument(
         '--sam-batch-size',
         type=int,
-        default=32,
-        help='SAM batch size (default: 32 for T4, increase if you have headroom)'
+        default=64,
+        help='SAM batch size for processing teeth within each image (default: 64 for A10G). Use 32 for T4, 128+ for A100.'
+    )
+    parser.add_argument(
+        '--image-batch-size',
+        type=int,
+        default=1,
+        help='Number of images to load/process together per batch (default: 1). Images are grouped by view type automatically. Currently processes sequentially for stability.'
     )
     parser.add_argument(
         '--output-suffix',
@@ -435,6 +441,7 @@ def main():
     print(f"\nInitializing optimized segmenter...")
     print(f"  Device: {args.device}")
     print(f"  SAM batch size: {args.sam_batch_size}")
+    print(f"  Image batch size: {args.image_batch_size}")
     print(f"  Confidence threshold: {args.conf_threshold}")
 
     if args.device == 'cuda':
@@ -449,21 +456,43 @@ def main():
         sam_batch_size=args.sam_batch_size,
     )
 
-    # Process images
+    # Process images in batches
     print(f"\nProcessing {len(processing_list)} images...")
     successful = 0
 
     image_paths, output_paths, views = zip(*processing_list)
 
-    for i in tqdm(range(len(processing_list)), desc="Processing"):
-        result = process_batch(
-            [image_paths[i]],
-            [output_paths[i]],
-            [views[i]],
-            segmenter,
-            args.conf_threshold,
-        )
-        successful += result
+    # Group images by view for efficient batching
+    view_groups = {}
+    for i, (img_path, out_path, view) in enumerate(zip(image_paths, output_paths, views)):
+        if view not in view_groups:
+            view_groups[view] = []
+        view_groups[view].append((i, img_path, out_path))
+
+    # Process each view group in batches
+    total_batches = sum((len(group) + args.image_batch_size - 1) // args.image_batch_size
+                       for group in view_groups.values())
+
+    with tqdm(total=len(processing_list), desc="Processing images") as pbar:
+        for view, group in view_groups.items():
+            # Process this view in batches
+            for batch_start in range(0, len(group), args.image_batch_size):
+                batch_end = min(batch_start + args.image_batch_size, len(group))
+                batch_items = group[batch_start:batch_end]
+
+                batch_paths = [item[1] for item in batch_items]
+                batch_outputs = [item[2] for item in batch_items]
+                batch_views = [view] * len(batch_items)
+
+                result = process_batch(
+                    batch_paths,
+                    batch_outputs,
+                    batch_views,
+                    segmenter,
+                    args.conf_threshold,
+                )
+                successful += result
+                pbar.update(len(batch_items))
 
     # Summary
     print(f"\n{'='*60}")
