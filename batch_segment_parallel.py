@@ -293,6 +293,16 @@ def main():
         help='Output file suffix (default: _mask)'
     )
     parser.add_argument(
+        '--skip-existing',
+        action='store_true',
+        help='Skip images that already have output masks (allows resuming interrupted runs)'
+    )
+    parser.add_argument(
+        '--verbose',
+        action='store_true',
+        help='Show detailed timing for each batch'
+    )
+    parser.add_argument(
         '--dry-run',
         action='store_true',
         help='List files without processing'
@@ -340,7 +350,19 @@ def main():
         view_stats[view] += 1
 
         output_path = img_path.parent / f"{frame_index}{args.output_suffix}.png"
+
+        # Skip if output already exists and --skip-existing is set
+        if args.skip_existing and output_path.exists():
+            continue
+
         processing_list.append((img_path, output_path, view))
+
+    # Report skipped files
+    total_found = len(image_data)
+    skipped = total_found - len(processing_list) if args.skip_existing else 0
+    if args.skip_existing and skipped > 0:
+        print(f"\nSkipped {skipped} images with existing masks")
+        print(f"Processing {len(processing_list)} remaining images")
 
     print(f"\nView classification statistics:")
     for view_type, count in sorted(view_stats.items()):
