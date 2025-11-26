@@ -87,8 +87,17 @@ def robust_view_classification(extrinsics: np.ndarray, arch_type: str) -> str:
         return "front"
 
 
-def find_images_with_cameras(root_dir: str) -> List[Tuple[Path, Path, str, str]]:
-    """Find all images with camera data."""
+def find_images_with_cameras(root_dir: str, exclude_suffix: str = '_mask') -> List[Tuple[Path, Path, str, str]]:
+    """
+    Find all images with camera data, excluding output files.
+
+    Args:
+        root_dir: Root directory to search
+        exclude_suffix: Suffix to exclude (e.g., '_mask' to skip files like '0003_mask.png')
+
+    Returns:
+        List of tuples (input_path, camera_data_path, camera_side, frame_index)
+    """
     root_path = Path(root_dir)
     image_data = []
 
@@ -106,6 +115,11 @@ def find_images_with_cameras(root_dir: str) -> List[Tuple[Path, Path, str, str]]
 
             for img_path in sorted(side_dir.glob('*.png')):
                 frame_index = img_path.stem
+
+                # Skip files that match the exclude pattern (e.g., output mask files)
+                if exclude_suffix and frame_index.endswith(exclude_suffix):
+                    continue
+
                 image_data.append((img_path, camera_file, side, frame_index))
 
     return sorted(image_data)
@@ -533,7 +547,7 @@ def main():
 
     # Find all images with camera data
     print(f"Searching for images in: {args.input_dir}")
-    image_data = find_images_with_cameras(args.input_dir)
+    image_data = find_images_with_cameras(args.input_dir, exclude_suffix=args.output_suffix)
 
     if not image_data:
         print("No images found!")

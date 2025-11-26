@@ -317,7 +317,7 @@ def main():
 
     # Find all images with camera data
     print(f"Searching for images in: {args.input_dir}")
-    image_data = find_images_with_cameras(args.input_dir)
+    image_data = find_images_with_cameras(args.input_dir, exclude_suffix=args.output_suffix)
 
     if not image_data:
         print("No images found!")
