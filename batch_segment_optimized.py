@@ -166,10 +166,20 @@ class OptimizedSegmenter:
         if view not in self.yolo_models:
             print(f"Loading YOLO model for {view} view on {self.device}...")
             with suppress_stdout():
+                # CRITICAL: Pass device to YOLO constructor for proper GPU loading
                 model = YOLO(model=get_model_path(view, self.weight_dir))
-                # Move model to GPU
                 if self.device == 'cuda':
+                    # Force model to GPU - use both methods for compatibility
                     model.to('cuda')
+                    # Verify it worked
+                    model_device = str(next(model.model.parameters()).device)
+                    if 'cpu' in model_device.lower():
+                        print(f"  WARNING: YOLO model is on CPU despite .to('cuda')! Trying alternative...")
+                        # Try alternative method
+                        import torch
+                        model.model = model.model.cuda()
+                        model_device = str(next(model.model.parameters()).device)
+                    print(f"  YOLO model device: {model_device}")
             self.yolo_models[view] = model
         return self.yolo_models[view]
 
