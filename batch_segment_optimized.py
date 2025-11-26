@@ -301,6 +301,7 @@ def process_batch(
     views: List[str],
     segmenter: OptimizedSegmenter,
     conf_threshold: float,
+    verbose: bool = False,
 ) -> int:
     """
     Process a batch of images together with true multi-image batching.
@@ -325,6 +326,9 @@ def process_batch(
     if len(image_paths) == 0:
         return 0
 
+    import time
+    batch_start = time.time()
+
     # Assume all images in batch have same view (guaranteed by caller)
     view = views[0]
 
@@ -334,6 +338,10 @@ def process_batch(
     names = yolo.model.names if not should_flip else LEFT_CLASSES
 
     # Step 1: Load all images and run YOLO detections
+    if verbose:
+        print(f"\n  Processing batch of {len(image_paths)} images (view: {view})")
+
+    io_start = time.time()
     batch_data = []  # List of (image, boxes, clss, input_path, output_path)
 
     for input_path, output_path in zip(image_paths, output_paths):
@@ -398,6 +406,10 @@ def process_batch(
     if len(batch_data) == 0:
         return 0
 
+    io_time = time.time() - io_start
+    if verbose:
+        print(f"    I/O + YOLO: {io_time:.2f}s ({io_time/len(batch_data)*1000:.0f}ms per image)")
+
     # Step 2: Compute SAM embeddings for all images and collect all boxes
     all_boxes = []
     all_image_indices = []
@@ -418,6 +430,7 @@ def process_batch(
 
     # Step 3: Process all boxes through SAM in large batches
     # We'll process each image's SAM separately since SAM needs image embeddings
+    sam_start = time.time()
     successful = 0
 
     for img_idx, data in enumerate(batch_data):
@@ -437,6 +450,14 @@ def process_batch(
 
         except Exception as e:
             print(f"Error saving mask for {data['output_path']}: {e}")
+
+    sam_time = time.time() - sam_start
+    total_time = time.time() - batch_start
+
+    if verbose:
+        print(f"    SAM: {sam_time:.2f}s ({sam_time/len(batch_data)*1000:.0f}ms per image)")
+        print(f"    Total: {total_time:.2f}s ({total_time/len(batch_data)*1000:.0f}ms per image)")
+        print(f"    Throughput: {len(batch_data)/total_time:.2f} images/sec")
 
     return successful
 
@@ -488,6 +509,16 @@ def main():
         help='Output file suffix (default: _mask)'
     )
     parser.add_argument(
+        '--skip-existing',
+        action='store_true',
+        help='Skip images that already have output masks (allows resuming interrupted runs)'
+    )
+    parser.add_argument(
+        '--verbose',
+        action='store_true',
+        help='Show detailed timing for each batch'
+    )
+    parser.add_argument(
         '--dry-run',
         action='store_true',
         help='List files without processing'
@@ -535,7 +566,19 @@ def main():
         view_stats[view] += 1
 
         output_path = img_path.parent / f"{frame_index}{args.output_suffix}.png"
+
+        # Skip if output already exists and --skip-existing is set
+        if args.skip_existing and output_path.exists():
+            continue
+
         processing_list.append((img_path, output_path, view))
+
+    # Report skipped files
+    total_found = len(image_data)
+    skipped = total_found - len(processing_list) if args.skip_existing else 0
+    if args.skip_existing and skipped > 0:
+        print(f"\nSkipped {skipped} images with existing masks")
+        print(f"Processing {len(processing_list)} remaining images")
 
     print(f"\nView classification statistics:")
     for view_type, count in sorted(view_stats.items()):
@@ -603,6 +646,7 @@ def main():
                     batch_views,
                     segmenter,
                     args.conf_threshold,
+                    verbose=args.verbose,
                 )
                 successful += result
                 pbar.update(len(batch_items))
