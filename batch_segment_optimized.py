@@ -164,6 +164,9 @@ class OptimizedSegmenter:
             self.sam = self.sam.to(self.device)
             self.sam.eval()  # Set to evaluation mode
 
+        # CRITICAL: Verify SAM is properly configured
+        self._verify_sam_setup()
+
         # Cache YOLO models per view
         self.yolo_models = {}
         print(f"Models will be loaded on {self.device}")
@@ -174,6 +177,113 @@ class OptimizedSegmenter:
             # Enable TF32 for faster computation on Ampere+ GPUs
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
+
+    def _verify_sam_setup(self):
+        """Verify SAM model is properly configured for GPU inference."""
+        print("\n" + "="*60)
+        print("SAM Model Verification")
+        print("="*60)
+
+        # 1. Device check - CRITICAL
+        sam_device = str(next(self.sam.parameters()).device)
+        print(f"✓ SAM device: {sam_device}")
+        if self.device == 'cuda' and 'cpu' in sam_device.lower():
+            raise RuntimeError(
+                f"CRITICAL ERROR: SAM model is on CPU despite requesting CUDA!\n"
+                f"Expected device: cuda, Got: {sam_device}\n"
+                f"This will cause 10-20x slowdown (12+ seconds per image).\n"
+                f"Fix: Ensure torch is installed with CUDA support."
+            )
+
+        # 2. Model architecture
+        sam_class = type(self.sam).__name__
+        encoder_class = self.sam.image_encoder.__class__.__name__
+        print(f"✓ SAM model: {sam_class}")
+        print(f"✓ Image encoder: {encoder_class}")
+
+        # Verify we're using Mobile SAM (vit_tiny)
+        if encoder_class != 'TinyViT':
+            print(f"  WARNING: Expected TinyViT (Mobile SAM), got {encoder_class}")
+            print(f"  This may be slower than expected.")
+
+        # 3. Model mode
+        is_training = self.sam.training
+        print(f"✓ Model mode: {'training' if is_training else 'eval'}")
+        if is_training:
+            print(f"  WARNING: Model is in training mode! Should be eval mode.")
+            print(f"  Calling model.eval() now...")
+            self.sam.eval()
+
+        # 4. Memory/Performance info
+        if self.device == 'cuda':
+            # Count parameters
+            param_count = sum(p.numel() for p in self.sam.parameters())
+            param_mb = param_count * 4 / 1024 / 1024  # Assume float32
+            print(f"✓ Model size: {param_mb:.1f} MB ({param_count:,} parameters)")
+
+            # Expected: Mobile SAM ~10M params, ~40MB
+            if param_count > 50_000_000:
+                print(f"  WARNING: Model seems large! Expected ~10M params for Mobile SAM")
+                print(f"  You may be using SAM-Base or SAM-Huge (much slower)")
+
+            # GPU memory
+            gpu_mem = torch.cuda.memory_allocated(0) / 1e9
+            print(f"✓ GPU memory allocated: {gpu_mem:.2f} GB")
+
+            # cuDNN status
+            print(f"✓ cuDNN enabled: {torch.backends.cudnn.enabled}")
+            print(f"✓ cuDNN benchmark: {torch.backends.cudnn.benchmark}")
+
+        # 5. Quick performance test
+        if self.device == 'cuda':
+            print(f"\nRunning quick SAM performance test...")
+            import time
+
+            # Create dummy image and box
+            dummy_image = np.random.randint(0, 255, (1024, 1024, 3), dtype=np.uint8)
+            dummy_boxes = np.array([[100, 100, 300, 300]])
+
+            # Warm up
+            try:
+                _ = self._sam_predict_optimized(dummy_boxes, dummy_image)
+                torch.cuda.synchronize()
+
+                # Time it
+                start = time.time()
+                _ = self._sam_predict_optimized(dummy_boxes, dummy_image)
+                torch.cuda.synchronize()
+                elapsed = time.time() - start
+
+                print(f"✓ SAM test: {elapsed*1000:.0f}ms for 1 box on 1024x1024 image")
+
+                if elapsed > 2.0:
+                    print(f"  ⚠️  WARNING: SAM is VERY SLOW! ({elapsed:.1f}s)")
+                    print(f"  Expected: <500ms on GPU")
+                    print(f"  This suggests SAM is running on CPU!")
+                    raise RuntimeError(
+                        f"SAM performance test failed: {elapsed:.1f}s (expected <0.5s)\n"
+                        f"SAM is likely running on CPU instead of GPU."
+                    )
+                elif elapsed > 0.8:
+                    print(f"  ⚠️  WARNING: SAM is slower than expected")
+                    print(f"  Expected: <500ms, Got: {elapsed*1000:.0f}ms")
+                else:
+                    print(f"  ✅ Performance looks good!")
+
+            except Exception as e:
+                print(f"  Could not run performance test: {e}")
+
+        # 6. Expected performance summary
+        print(f"\n{'='*60}")
+        print(f"Expected SAM Performance (per image):")
+        if self.device == 'cuda':
+            print(f"  Embedding: 200-500ms")
+            print(f"  Box inference (per batch): 50-200ms")
+            print(f"  Total per image: 300-700ms")
+            print(f"\n  If you see >2 seconds per image, SAM is likely on CPU!")
+        else:
+            print(f"  CPU mode: 5-15 seconds per image (expected)")
+        print(f"{'='*60}\n")
 
     def get_yolo_model(self, view: str) -> YOLO:
         """Get or load YOLO model for specific view."""
