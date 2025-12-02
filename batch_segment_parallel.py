@@ -307,6 +307,11 @@ def main():
         action='store_true',
         help='List files without processing'
     )
+    parser.add_argument(
+        '--fp16',
+        action='store_true',
+        help='Use half precision (FP16) for faster inference. Recommended for modern GPUs (T4, A10G, A100).'
+    )
 
     args = parser.parse_args()
 
@@ -384,6 +389,7 @@ def main():
     print(f"  Image batch size: {args.image_batch_size}")
     print(f"  I/O workers: {args.io_workers}")
     print(f"  Confidence threshold: {args.conf_threshold}")
+    print(f"  FP16 (half precision): {args.fp16}")
 
     if args.device == 'cuda':
         if torch.cuda.is_available():
@@ -394,6 +400,7 @@ def main():
         weight_dir=args.weight_dir,
         device=args.device,
         sam_batch_size=args.sam_batch_size,
+        use_fp16=args.fp16,
     )
 
     # Initialize parallel I/O
