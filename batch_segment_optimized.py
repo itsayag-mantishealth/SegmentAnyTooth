@@ -139,7 +139,7 @@ def get_model_path(model: str, weight_dir: str) -> str:
 class OptimizedSegmenter:
     """Optimized segmenter that loads models once and reuses them."""
 
-    def __init__(self, weight_dir: str, device: str = 'cuda', sam_batch_size: int = 64):
+    def __init__(self, weight_dir: str, device: str = 'cuda', sam_batch_size: int = 64, use_fp16: bool = False):
         """
         Initialize segmenter with models loaded onto GPU.
 
@@ -147,21 +147,28 @@ class OptimizedSegmenter:
             weight_dir: Path to model weights
             device: Device to use ('cuda' or 'cpu')
             sam_batch_size: Batch size for SAM inference (default: 64 for A10G, 32 for T4, 128+ for A100)
+            use_fp16: Use half precision (FP16) for faster inference (default: False)
         """
         self.device = device
         self.weight_dir = weight_dir
         self.sam_batch_size = sam_batch_size
+        self.use_fp16 = use_fp16 and device == 'cuda'  # FP16 only works well on GPU
 
         # Check GPU availability
         if device == 'cuda' and not torch.cuda.is_available():
             print("Warning: CUDA not available, falling back to CPU")
             self.device = 'cpu'
+            self.use_fp16 = False
 
         # Load SAM model once
         print(f"Loading SAM model on {self.device}...")
+        if self.use_fp16:
+            print(f"  Using FP16 (half precision) via autocast for faster inference")
         with suppress_stdout():
             self.sam = sam_load(get_model_path("sam", weight_dir))
             self.sam = self.sam.to(self.device)
+            # Note: We don't convert model to .half() directly - we use autocast instead
+            # which handles mixed precision properly and avoids dtype mismatch errors
             self.sam.eval()  # Set to evaluation mode
 
         # CRITICAL: Verify SAM is properly configured
@@ -300,9 +307,9 @@ class OptimizedSegmenter:
                     if 'cpu' in model_device.lower():
                         print(f"  WARNING: YOLO model is on CPU despite .to('cuda')! Trying alternative...")
                         # Try alternative method
-                        import torch
                         model.model = model.model.cuda()
                         model_device = str(next(model.model.parameters()).device)
+                    # Note: YOLO handles FP16 via its own 'half' parameter in predict()
                     print(f"  YOLO model device: {model_device}")
             self.yolo_models[view] = model
         return self.yolo_models[view]
@@ -382,39 +389,43 @@ class OptimizedSegmenter:
     @torch.no_grad()
     def _sam_predict_optimized(self, boxes_xyxy: np.ndarray, image: np.ndarray) -> np.ndarray:
         """Optimized SAM prediction with larger batches."""
-        predictor = SamMobilePredictor(self.sam)
-        predictor.set_image(image)
+        predictor = SamMobilePredictor(self.sam, use_fp16=self.use_fp16)
 
-        batch_boxes = np.split(
-            boxes_xyxy,
-            range(self.sam_batch_size, len(boxes_xyxy), self.sam_batch_size)
-        )
-        batch_masks = []
+        # Use autocast for the entire SAM pipeline when FP16 is enabled
+        with torch.amp.autocast('cuda', enabled=self.use_fp16):
+            predictor.set_image(image)
 
-        for boxes in batch_boxes:
-            # Use pinned memory for faster transfer
-            boxes_tensor = torch.tensor(boxes, dtype=torch.float32)
-            if self.device == 'cuda':
-                boxes_tensor = boxes_tensor.pin_memory()
-
-            transformed_boxes = predictor.transform.apply_boxes_torch(
-                boxes_tensor, image.shape[:2]
-            ).to(self.device, non_blocking=True)
-
-            sam_masks, _, _ = predictor.predict_torch(
-                point_coords=None,
-                point_labels=None,
-                boxes=transformed_boxes,
-                multimask_output=False,
-                hq_token_only=False,
+            batch_boxes = np.split(
+                boxes_xyxy,
+                range(self.sam_batch_size, len(boxes_xyxy), self.sam_batch_size)
             )
+            batch_masks = []
 
-            sam_masks = sam_masks.squeeze().cpu().numpy().astype(np.uint8)
+            for boxes in batch_boxes:
+                # Use pinned memory for faster transfer
+                boxes_tensor = torch.tensor(boxes, dtype=torch.float32)
+                if self.device == 'cuda':
+                    boxes_tensor = boxes_tensor.pin_memory()
 
-            if len(sam_masks.shape) == 2:
-                batch_masks.append(sam_masks)
-            else:
-                batch_masks.extend(sam_masks.tolist())
+                # Apply transform and move to device
+                transformed_boxes = predictor.transform.apply_boxes_torch(
+                    boxes_tensor, image.shape[:2]
+                ).to(device=self.device, non_blocking=True)
+
+                sam_masks, _, _ = predictor.predict_torch(
+                    point_coords=None,
+                    point_labels=None,
+                    boxes=transformed_boxes,
+                    multimask_output=False,
+                    hq_token_only=False,
+                )
+
+                sam_masks = sam_masks.squeeze().cpu().numpy().astype(np.uint8)
+
+                if len(sam_masks.shape) == 2:
+                    batch_masks.append(sam_masks)
+                else:
+                    batch_masks.extend(sam_masks.tolist())
 
         return np.stack(batch_masks)
 
@@ -647,6 +658,11 @@ def main():
         action='store_true',
         help='List files without processing'
     )
+    parser.add_argument(
+        '--fp16',
+        action='store_true',
+        help='Use half precision (FP16) for faster inference. Recommended for modern GPUs (T4, A10G, A100).'
+    )
 
     args = parser.parse_args()
 
@@ -723,6 +739,7 @@ def main():
     print(f"  SAM batch size: {args.sam_batch_size}")
     print(f"  Image batch size: {args.image_batch_size}")
     print(f"  Confidence threshold: {args.conf_threshold}")
+    print(f"  FP16 (half precision): {args.fp16}")
 
     if args.device == 'cuda':
         # Print GPU info
@@ -734,6 +751,7 @@ def main():
         weight_dir=args.weight_dir,
         device=args.device,
         sam_batch_size=args.sam_batch_size,
+        use_fp16=args.fp16,
     )
 
     # Process images in batches
