@@ -69,6 +69,7 @@ class SamMobilePredictor:
     def __init__(
         self,
         sam_model: Sam,
+        use_fp16: bool = False,  # Kept for API compatibility, but autocast handles FP16
     ) -> None:
         """
         Uses SAM to calculate the image embedding for an image, and then
@@ -76,6 +77,7 @@ class SamMobilePredictor:
 
         Arguments:
           sam_model (Sam): The model to use for mask prediction.
+          use_fp16 (bool): Unused - FP16 is handled via torch.cuda.amp.autocast()
         """
         super().__init__()
         self.model = sam_model
